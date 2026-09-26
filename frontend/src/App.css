@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root { min-height: 100%; margin: 0; }
+
+body {
+  background-color: #0F172A;
+  background-image:
+    radial-gradient(900px 500px at 12% -10%, rgba(139, 92, 246, 0.28), transparent 60%),
+    radial-gradient(700px 420px at 92% 0%, rgba(251, 113, 133, 0.16), transparent 60%),
+    radial-gradient(800px 500px at 60% 110%, rgba(52, 211, 153, 0.12), transparent 60%);
+  background-attachment: fixed;
+  color: #F8FAFC;
+  font-family: 'Plus Jakarta Sans', Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: rgba(139, 92, 246, 0.5); }
+
+/* slim dark scrollbars */
+* { scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.2) transparent; }
+
+@layer components {
+  .glass {
+    @apply border border-white/10 bg-white/[0.04] backdrop-blur-xl;
+  }
+  .grad-text {
+    @apply bg-gradient-to-r from-violet-400 via-coral to-mint bg-clip-text text-transparent;
+  }
+  .grad-btn {
+    @apply bg-gradient-to-r from-violet-500 to-coral text-white shadow-lg shadow-violet-500/30
+      transition hover:brightness-110 hover:shadow-violet-500/50 active:scale-[0.98]
+      disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none;
+  }
+}
