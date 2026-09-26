@@ -22,9 +22,12 @@ import aem
 from mock_data import DEFAULT_MOCK, MOCK_PAGES
 from prompts import (
     APPLY_PROMPT,
+    BOLD_REWRITE_PROMPT,
     BRAND_GUIDELINES,
-    GENERATE_PROMPT,
     IMAGE_PROMPT_GENERATOR,
+    IMAGE_VARIANT_STYLES,
+    SAFE_REFRESH_PROMPT,
+    SEO_OPTIMIZED_PROMPT,
     SUGGEST_PROMPT,
 )
 
@@ -63,11 +66,33 @@ def fill(template: str, **values: str) -> str:
     return template
 
 
-async def gemini_text(prompt: str) -> str:
-    response = await asyncio.to_thread(
-        client.models.generate_content, model=MODEL, contents=prompt
-    )
-    return (response.text or "").strip()
+GEMINI_SLOTS = asyncio.Semaphore(8)  # cap concurrent Gemini calls so a big page doesn't trip rate limits
+_TRANSIENT = ("429", "500", "503", "UNAVAILABLE", "RESOURCE_EXHAUSTED")
+
+
+async def _with_retry(fn, *args):
+    """Run a blocking Gemini call in a thread; retry twice on rate-limit / overload errors."""
+    for attempt in range(3):
+        try:
+            async with GEMINI_SLOTS:
+                return await asyncio.to_thread(fn, *args)
+        except Exception as e:
+            if attempt == 2 or not any(t in str(e) for t in _TRANSIENT):
+                raise
+            await asyncio.sleep(2 * (attempt + 1))
+
+
+def _call_text(prompt: str, model: str) -> str:
+    if "omni" in model:  # Omni models only speak the Interactions API
+        result = client.interactions.create(model=model, input=prompt)
+        if result.errors:
+            raise ValueError(f"{model}: {result.errors}")
+        return result.output_text or ""
+    return client.models.generate_content(model=model, contents=prompt).text or ""
+
+
+async def gemini_text(prompt: str, model: str | None = None) -> str:
+    return (await _with_retry(_call_text, prompt, model or MODEL)).strip()
 
 
 def strip_fences(text: str) -> str:
@@ -92,7 +117,7 @@ async def fetch_page(path: str):
     return page
 
 
-# ---------- generate ----------
+# ---------- text variants: 3 strategies / models per component ----------
 
 class GenerateComponent(BaseModel):
     id: str
@@ -104,36 +129,88 @@ class GenerateRequest(BaseModel):
     components: list[GenerateComponent]
 
 
-async def generate_one(comp: GenerateComponent) -> dict:
+TEXT_VARIANTS = [
+    {
+        "variantId": "safe",
+        "label": "Safe Refresh",
+        "model": os.environ.get("GEMINI_MODEL_SAFE", MODEL),
+        "color": "green",
+        "prompt": SAFE_REFRESH_PROMPT,
+    },
+    {
+        "variantId": "bold",
+        "label": "Bold Rewrite",
+        "model": os.environ.get("GEMINI_MODEL_BOLD", "gemini-omni-1.1-flash"),
+        "color": "violet",
+        "prompt": BOLD_REWRITE_PROMPT,
+    },
+    {
+        "variantId": "seo",
+        "label": "SEO Optimized",
+        "model": os.environ.get("GEMINI_MODEL_SEO", MODEL),
+        "color": "blue",
+        "prompt": SEO_OPTIMIZED_PROMPT,
+    },
+]
+
+
+async def generate_text_variant(cfg: dict, comp: GenerateComponent) -> dict:
+    prompt = fill(
+        cfg["prompt"],
+        brand_guidelines=BRAND_GUIDELINES,
+        component_type=comp.type,
+        current_content=comp.currentContent,
+    )
+    variant = {k: cfg[k] for k in ("variantId", "label", "model", "color")}
     try:
-        prompt = fill(
-            GENERATE_PROMPT,
-            brand_guidelines=BRAND_GUIDELINES,
-            component_type=comp.type,
-            current_content=comp.currentContent,
-        )
-        text = strip_fences(await gemini_text(prompt))
+        try:
+            text = strip_fences(await gemini_text(prompt, cfg["model"]))
+        except Exception as e:
+            if cfg["model"] == MODEL:
+                raise
+            # A non-default model (e.g. Omni) is down: fall back so the card isn't empty.
+            log.warning("%s failed for %s (%s); falling back to %s", cfg["model"], comp.id, e, MODEL)
+            text = strip_fences(await gemini_text(prompt, MODEL))
+            variant["model"] = MODEL
+            variant["fallbackFrom"] = cfg["model"]
         if not text:
             raise ValueError("empty response")
-        return {"id": comp.id, "generatedContent": text}
+        variant["generatedContent"] = text
     except Exception as e:
-        log.warning("generate failed for %s: %s", comp.id, e)
-        return {"id": comp.id, "generatedContent": None, "error": str(e)[:200]}
+        log.warning("%s variant failed for %s: %s", cfg["variantId"], comp.id, e)
+        variant["generatedContent"] = None
+        variant["error"] = str(e)[:200]
+    return variant
 
 
-@app.post("/api/generate-text")
-async def generate_text(req: GenerateRequest):
-    results = await asyncio.gather(*(generate_one(c) for c in req.components))
-    return {"results": results}
+@app.post("/api/generate-text-variants")
+async def generate_text_variants(req: GenerateRequest):
+    """components x 3 variants, all in parallel."""
+
+    async def one(comp: GenerateComponent) -> dict:
+        variants = await asyncio.gather(*(generate_text_variant(cfg, comp) for cfg in TEXT_VARIANTS))
+        return {"id": comp.id, "variants": list(variants)}
+
+    return {"results": await asyncio.gather(*(one(c) for c in req.components))}
 
 
-# ---------- generate-image ----------
+# ---------- image variants: 3 visual styles per component ----------
 
-class GenerateImageRequest(BaseModel):
-    componentId: str
-    prompt: str | None = None  # omitted = auto-write one from the context + brand
+IMAGE_VARIANTS = [
+    ("product", "Product Focus", "green"),
+    ("lifestyle", "Lifestyle", "violet"),
+    ("editorial", "Editorial", "blue"),
+]
+
+
+class GenerateImageComponent(BaseModel):
+    id: str
     imageContext: str = ""
     altText: str = ""
+
+
+class GenerateImageVariantsRequest(BaseModel):
+    components: list[GenerateImageComponent]
 
 
 def _safe_id(component_id: str) -> str:
@@ -144,11 +221,12 @@ def _new_image_path(component_id: str, prefix: str = "") -> Path:
     return GENERATED_DIR / f"{prefix}{_safe_id(component_id)}_{time.time_ns() // 1_000_000}.png"
 
 
-async def build_image_prompt(image_context: str, alt_text: str) -> str:
+async def build_image_prompt(image_context: str, alt_text: str, style_instruction: str) -> str:
     prompt = fill(
         IMAGE_PROMPT_GENERATOR,
         image_context=image_context or "Image on a product page",
         alt_text=alt_text or "none",
+        style_instruction=style_instruction,
     )
     text = (await gemini_text(prompt)).strip().strip('"')
     if not text:
@@ -156,7 +234,7 @@ async def build_image_prompt(image_context: str, alt_text: str) -> str:
     return text
 
 
-def _render_image(prompt: str, component_id: str) -> str:
+def _render_image(prompt: str, name: str) -> str:
     response = client.models.generate_content(
         model=IMAGE_MODEL,
         contents=prompt,
@@ -165,22 +243,70 @@ def _render_image(prompt: str, component_id: str) -> str:
     parts = (response.candidates[0].content.parts or []) if response.candidates else []
     for part in parts:
         if part.inline_data is not None and part.inline_data.data:
-            path = _new_image_path(component_id)
+            path = _new_image_path(name)
             path.write_bytes(part.inline_data.data)
             return f"/static/generated/{path.name}"
     reason = " ".join(p.text for p in parts if getattr(p, "text", None))[:150]
     raise ValueError(f"model returned no image{': ' + reason if reason else ''}")
 
 
-@app.post("/api/generate-image")
-async def generate_image(req: GenerateImageRequest):
+async def generate_image_variant(comp: GenerateImageComponent, variant_id: str, label: str, color: str) -> dict:
+    variant = {
+        "variantId": variant_id,
+        "label": label,
+        "color": color,
+        "model": IMAGE_MODEL,
+        "generatedImageUrl": None,
+        "promptUsed": None,
+    }
     try:
-        prompt = (req.prompt or "").strip() or await build_image_prompt(req.imageContext, req.altText)
-        url = await asyncio.to_thread(_render_image, prompt, req.componentId)
+        variant["promptUsed"] = await build_image_prompt(
+            comp.imageContext, comp.altText, IMAGE_VARIANT_STYLES[variant_id]
+        )
+        variant["generatedImageUrl"] = await _with_retry(
+            _render_image, variant["promptUsed"], f"{comp.id}_{variant_id}"
+        )
     except Exception as e:
-        log.warning("image generation failed for %s: %s", req.componentId, e)
+        # promptUsed is kept when only the render failed, so the user can edit it and retry.
+        log.warning("%s image failed for %s: %s", variant_id, comp.id, e)
+        variant["error"] = str(e)[:200]
+    return variant
+
+
+@app.post("/api/generate-image-variants")
+async def generate_image_variants(req: GenerateImageVariantsRequest):
+    """components x 3 styles; each runs prompt-writer -> image model, all in parallel."""
+
+    async def one(comp: GenerateImageComponent) -> dict:
+        variants = await asyncio.gather(*(generate_image_variant(comp, *v) for v in IMAGE_VARIANTS))
+        return {"id": comp.id, "variants": list(variants)}
+
+    return {"results": await asyncio.gather(*(one(c) for c in req.components))}
+
+
+class RegenerateImageRequest(BaseModel):
+    componentId: str
+    variantId: str
+    prompt: str
+
+
+@app.post("/api/regenerate-image")
+async def regenerate_image(req: RegenerateImageRequest):
+    """Re-render one variant from the user's (edited) prompt."""
+    prompt = req.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt is empty")
+    try:
+        url = await _with_retry(_render_image, prompt, f"{req.componentId}_{req.variantId}")
+    except Exception as e:
+        log.warning("regenerate failed for %s/%s: %s", req.componentId, req.variantId, e)
         raise HTTPException(status_code=502, detail=f"Image generation failed: {str(e)[:200]}")
-    return {"componentId": req.componentId, "generatedImageUrl": url, "promptUsed": prompt}
+    return {
+        "componentId": req.componentId,
+        "variantId": req.variantId,
+        "generatedImageUrl": url,
+        "promptUsed": prompt,
+    }
 
 
 # ---------- upload-image (user's own replacement) ----------
@@ -287,6 +413,7 @@ class PublishComponent(BaseModel):
     id: str
     type: str = "text"
     jcrPath: str
+    selectedVariant: str | None = None  # which AI variant the user picked (for the log/response)
     updatedContent: str = ""
     updatedImageUrl: str | None = None  # image components
 
@@ -315,8 +442,8 @@ async def publish(req: PublishRequest):
     return {
         "status": "success",
         "message": f"Published {len(req.components)} components to AEM",
-        "published": [c.id for c in req.components],
-        "skipped": [],
+        "published": [{"id": c.id, "variant": c.selectedVariant} for c in req.components],
+        "skipped": [],  # the frontend only sends components that have a selected variant
     }
 
 

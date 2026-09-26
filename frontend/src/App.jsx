@@ -1,16 +1,15 @@
 import { useEffect, useState } from 'react'
 import PageInput from './components/PageInput.jsx'
-import ComponentRow from './components/ComponentRow.jsx'
+import ComponentSection from './components/ComponentSection.jsx'
 import PublishBar from './components/PublishBar.jsx'
 import { useFetchPage } from './hooks/useFetchPage.js'
-import { useGenerateText } from './hooks/useGenerateText.js'
-import { useGenerateImage } from './hooks/useGenerateImage.js'
+import { useGenerateTextVariants } from './hooks/useGenerateTextVariants.js'
+import { useGenerateImageVariants } from './hooks/useGenerateImageVariants.js'
 
 export default function App() {
   const { fetchPage, page, isLoading, error } = useFetchPage()
-  const text = useGenerateText()
-  const img = useGenerateImage()
-  const { contents, statuses } = text
+  const text = useGenerateTextVariants()
+  const img = useGenerateImageVariants()
   const [isPublishing, setIsPublishing] = useState(false)
   const [toast, setToast] = useState(null) // { kind: 'success' | 'error', text }
 
@@ -22,15 +21,13 @@ export default function App() {
 
   const components = page?.components ?? []
   const anyLoading = [...Object.values(text.loadingIds), ...Object.values(img.loadingIds)].some(Boolean)
-  const aiCount =
-    Object.values(statuses).filter((s) => s === 'ai').length +
-    Object.values(img.images).filter((i) => i.status === 'ai').length
-  const editedCount =
-    Object.values(statuses).filter((s) => s === 'edited').length +
-    Object.values(img.images).filter((i) => i.status !== 'ai').length
+  const isImage = (c) => c.type === 'image'
 
-  // Image components only go out once there is a generated/uploaded replacement.
-  const publishable = components.filter((c) => c.type !== 'image' || img.images[c.id]?.url)
+  // Only components with a picked variant are published; the rest keep their current content.
+  const selectedComponents = components.filter((c) =>
+    isImage(c) ? img.selected[c.id] && img.urlFor(c.id) : text.selected[c.id] && text.contentFor(c.id),
+  )
+  const editedCount = components.filter((c) => !isImage(c) && text.edits[c.id] !== undefined).length
 
   const handleFetch = async (path) => {
     text.reset()
@@ -38,8 +35,8 @@ export default function App() {
     setToast(null)
     const data = await fetchPage(path)
     if (!data) return
-    text.generate(data.components.filter((c) => c.type !== 'image'))
-    img.generate(data.components.filter((c) => c.type === 'image'))
+    text.generate(data.components.filter((c) => !isImage(c)))
+    img.generate(data.components.filter(isImage))
   }
 
   const handlePublish = async () => {
@@ -50,20 +47,33 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           pagePath: page.pagePath,
-          components: publishable.map((c) =>
-            c.type === 'image'
-              ? { id: c.id, type: c.type, jcrPath: c.jcrPath, updatedImageUrl: img.images[c.id].url }
-              : { id: c.id, type: c.type, jcrPath: c.jcrPath, updatedContent: contents[c.id] ?? c.currentContent },
+          components: selectedComponents.map((c) =>
+            isImage(c)
+              ? {
+                  id: c.id,
+                  type: c.type,
+                  jcrPath: c.jcrPath,
+                  selectedVariant: img.selected[c.id],
+                  updatedImageUrl: img.urlFor(c.id),
+                }
+              : {
+                  id: c.id,
+                  type: c.type,
+                  jcrPath: c.jcrPath,
+                  selectedVariant: text.selected[c.id],
+                  updatedContent: text.contentFor(c.id),
+                },
           ),
         }),
       })
       if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || `Server returned ${res.status}`)
       const data = await res.json()
+      const picks = data.published.map((p) => p.variant).filter(Boolean)
       setToast({
         kind: 'success',
-        text: data.skipped?.length
-          ? data.message
-          : `Published ${data.published.length} components successfully!`,
+        text: `Published ${data.published.length} of ${components.length} components${
+          picks.length ? ` (${picks.join(', ')})` : ''
+        }!`,
       })
     } catch (e) {
       setToast({ kind: 'error', text: `Publish failed: ${e.message}` })
@@ -83,7 +93,7 @@ export default function App() {
             AEM content refresh <span className="grad-text">copilot</span>
           </h1>
           <p className="mx-auto mt-3 max-w-xl text-slate-400">
-            Pull a page, watch it get rewritten on-brand, tweak it with live suggestions, publish. Done.
+            Pull a page, get three AI takes on every component, pick your favorite, tweak it, publish. Done.
           </p>
           <div className="mx-auto mt-8 max-w-2xl">
             <PageInput onFetch={handleFetch} isLoading={isLoading} />
@@ -96,7 +106,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="mx-auto w-full max-w-7xl flex-1 space-y-6 px-6 pb-10 pt-4">
+      <main className="mx-auto w-full max-w-[1440px] flex-1 space-y-6 px-6 pb-10 pt-4">
         {page && (
           <div className="animate-rise flex flex-wrap items-end justify-between gap-4">
             <div>
@@ -109,45 +119,22 @@ export default function App() {
                 {components.length} component{components.length === 1 ? '' : 's'}
               </span>
               <span className="rounded-full bg-violet-500/20 px-3 py-1.5 text-violet-300">
-                {aiCount} AI generated
+                {selectedComponents.length} selected
               </span>
               <span className="rounded-full bg-mint/15 px-3 py-1.5 text-mint">{editedCount} edited</span>
             </div>
           </div>
         )}
         {components.map((c, i) => (
-          <ComponentRow
-            key={c.id}
-            index={i}
-            component={c}
-            text={{
-              generatedContent: contents[c.id],
-              status: statuses[c.id] || 'original',
-              isLoading: !!text.loadingIds[c.id],
-              error: text.errors[c.id],
-              onContentChange: (value) => text.edit(c.id, value),
-              onRegenerate: () => text.generate([c]),
-            }}
-            image={{
-              image: img.images[c.id],
-              draft: img.drafts[c.id],
-              status: img.images[c.id]?.status || 'original',
-              isLoading: !!img.loadingIds[c.id],
-              error: img.errors[c.id],
-              onDraftChange: (value) => img.setDraft(c.id, value),
-              onRegenerate: () => img.generateOne(c),
-              onRegenerateWithPrompt: () => img.generateOne(c, img.drafts[c.id]),
-              onUpload: (file) => img.upload(c, file),
-            }}
-          />
+          <ComponentSection key={c.id} index={i} component={c} text={text} img={img} />
         ))}
         {!page && !isLoading && (
           <div className="mx-auto max-w-3xl pt-6">
             <div className="grid gap-4 sm:grid-cols-3">
               {[
                 ['🔗', 'Fetch', 'Drop in an AEM page path and we pull every component.'],
-                ['✨', 'Refresh', 'Gemini rewrites the copy and generates fresh on-brand images, in parallel.'],
-                ['🚀', 'Publish', 'Edit with live tips, then push it back to AEM.'],
+                ['✨', 'Compare', 'Three Gemini models and styles give you safe, bold and SEO copy plus three image looks.'],
+                ['🚀', 'Pick & publish', 'Choose a variant, tweak it with live tips, and push only your picks to AEM.'],
               ].map(([icon, title, blurb], i) => (
                 <div
                   key={title}
@@ -176,7 +163,8 @@ export default function App() {
           onPublish={handlePublish}
           isPublishing={isPublishing}
           disabled={anyLoading}
-          componentCount={publishable.length}
+          total={components.length}
+          selectedCount={selectedComponents.length}
         />
       )}
 
