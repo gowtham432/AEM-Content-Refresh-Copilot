@@ -86,7 +86,13 @@ The `Dockerfile` builds the React app and runs everything in one container: Fast
 
 **Render** (free tier): New > Blueprint > pick this repo (it reads `render.yaml`), paste `GEMINI_API_KEY` when asked, deploy. Any Docker host works the same way (Railway, Fly.io, Cloud Run): set `GEMINI_API_KEY` and expose `$PORT`.
 
-Every visitor's "Fetch" makes dozens of Gemini calls, so the key's quota is the limit for a public demo. Free-tier hosts also sleep when idle, so the first load after a pause takes a while.
+Notes for anyone trying the public demo:
+
+> ⏳ **Cold start:** Render's free tier sleeps after about 15 minutes idle, so the first load can take ~30 seconds to wake up. After that it's fast.
+
+> 🔑 **API quota:** each page fetch fires dozens of parallel Gemini calls (three variants per component, plus images). Many people fetching at the same moment can hit rate limits. For the best experience, let one page finish generating before fetching another.
+
+If Render gives you trouble, Railway works the same way with the same `Dockerfile`: connect the repo, add `GEMINI_API_KEY`, deploy.
 
 ## Brand guidelines
 
