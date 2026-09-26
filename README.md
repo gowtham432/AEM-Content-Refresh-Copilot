@@ -4,7 +4,7 @@ Enter an AEM page path and get **three AI variants of every component** next to 
 
 - **Frontend:** React + Vite + Tailwind
 - **Backend:** FastAPI + Google Gemini (`google-genai`)
-- **AEM:** real fetch/publish over the Sling API, or mock pages for demos
+- **AEM:** a real author instance over the Sling API, or the bundled mock AEM server (`backend/mock_aem_server.py`) for demos
 
 ## Run locally
 
@@ -35,8 +35,9 @@ The backend reads `.env` only at startup, and Vite reads `tailwind.config.js` on
 | `GEMINI_MODEL_BOLD` | `gemini-omni-1.1-flash` | Model for the Bold Rewrite variant. Omni models only work through the Interactions API, which the backend handles. If it fails, the variant falls back to `GEMINI_MODEL` and the card says so. |
 | `GEMINI_MODEL_SAFE` / `GEMINI_MODEL_SEO` | `GEMINI_MODEL` | Optional per-variant overrides. |
 | `GEMINI_IMAGE_MODEL` | `gemini-3.1-flash-lite-image` | Image generation model. |
-| `AEM_ENABLED` | `false` | `false` = mock pages, `true` = real AEM. |
-| `AEM_HOST` | `http://localhost:4502` | AEM author instance. |
+| `DEMO_VIDEO_URL` | `https://youtu.be/mErtyRKxPn0` | Demo video linked from the demo-mode panel. |
+| `AEM_HOST` | `http://localhost:4502` | Where the app reads and writes content: a real AEM author, or the mock server. |
+| `AEM_MODE` | `live` | `mock` when `AEM_HOST` is the mock server. It only makes the UI show the "Demo mode" panel and demo wording. |
 | `AEM_USER` / `AEM_PASSWORD` | `admin` / `admin` | Basic auth for fetch and publish. |
 | `FRONTEND_URL` | – | Extra CORS origin for deployed frontends. |
 
@@ -49,18 +50,42 @@ The backend reads `.env` only at startup, and Vite reads `tailwind.config.js` on
 5. **Images:** the selected image shows its prompt. Edit it (e.g. "violet glow" to "hot coral glow") and click **Regenerate**, or **Upload my own**.
 6. The bottom bar shows *N of M components selected*. **Publish** sends only the selected variants; components without a selection keep their current content.
 
-### AEM mode (`AEM_ENABLED=true`)
-- Fetch reads `{AEM_HOST}{path}.infinity.json` and picks up **text**, **title**, **image** and **teaser** components under `jcr:content`. Images need a `/content/dam/` `fileReference` and are shown via an authenticated backend proxy. A teaser becomes two cards: its text (`Pretitle / Title / Description / CTA`) and its image. Other component types (e.g. accordion) and empty components are skipped.
-- Teaser publish writes `pretitle`, `jcr:title`, `jcr:description` and the first button's text under `actions/`.
-- **Image publish overwrites the DAM asset** the component's `fileReference` points at (Assets HTTP API `PUT /api/assets/...`), re-encoded to the asset's own format (a `.jpg` stays a JPEG). Every page using that asset will show the new image, so try it on a test asset first. In mock mode the image URL is just logged.
+### Real AEM (`AEM_MODE=live`)
+- Fetch reads `{AEM_HOST}{path}.infinity.json` and picks up **text**, **title**, **image** and **teaser** components under `jcr:content`. Images can be a DAM asset (`fileReference` under `/content/dam/`) or a file uploaded directly onto the component (a `file` child node); both are shown via an authenticated backend proxy. A teaser becomes two cards: its text (`Pretitle / Title / Description / CTA`) and its image. Components inside containers (e.g. accordion panels) are labelled with the container's title. Other component types and empty components are skipped.
+- The page path can be a bare path, `path.html`, a full URL, or an editor URL; it's normalized to the JCR page path, and publish refuses any node path containing `.html`/`.json`.
+- Each component is published independently: one failure is reported (with the reason) and doesn't block the others. Teaser variants are forced to keep their `Title:/Description:/CTA:` lines; a teaser can also be published partially (only the labelled fields present are written).
+- Text and title: a Sling POST to `{AEM_HOST}{jcrPath}` (`text` + `textIsRich=true`, or `jcr:title`). Teaser: `pretitle`, `jcr:title`, `jcr:description`, and the first button's text under `actions/`.
+- **Image publish overwrites the existing image**, re-encoded to its own format (a `.jpg` stays a JPEG): for a DAM asset it replaces the original via the Assets HTTP API (`PUT /api/assets/...`), so every page using that asset shows the new image; for an inline image it replaces the component's `file` node.
 - Rich text is shown as plain text. Publishing rewrites it as simple `<p>` paragraphs, so inline formatting (bold, links) is lost.
-- Publish sends a Sling POST per component to `{AEM_HOST}{jcrPath}` (`text` + `textIsRich=true`, or `jcr:title`). It **changes real content**, so try it on a scratch page first.
+- All of this **changes real content**, so try it on a scratch page first.
 
-### Mock mode (`AEM_ENABLED=false`)
-Serves deliberately bland, corporate NUVOX copy and plain grey placeholder images (`backend/static/mock-images/`, recreate with `python create_mock_images.py`) so the brand refresh is an instant contrast:
-- `/content/nuvox/us/en/products/airwave-pro` (text, 2 images, accordion, teaser)
-- `/content/nuvox/us/en/about-us`
-- any other path returns a sample page. Publish only logs the payload.
+### Mock AEM (`AEM_MODE=mock`)
+Real AEM needs heavy infrastructure, so for demos there is a tiny stand-in, `backend/mock_aem_server.py`. It has no UI: it just answers on the same URLs as an AEM author (port 4502 by default), so the app can't tell the difference and there's no mock-specific code in it.
+
+```bash
+cd backend
+uvicorn mock_aem_server:app --port 4502     # then set AEM_HOST=http://localhost:4502 and AEM_MODE=mock
+```
+
+| Request | Answer |
+| --- | --- |
+| `GET /<page>.infinity.json` (also `.json`, `.1.json` ...) | the page's JCR tree; only the two sample pages exist, everything else is 404 |
+| `GET /content/dam/...` | a generated grey placeholder image |
+| `POST /<node path>` (Sling POST) | 200 if the node exists (404 otherwise), and the properties are logged |
+| `PUT /api/assets/...` | 200, and logged |
+| `GET /_publish-log` | everything received so far (a peek at what "publish" sent) |
+
+It is read-only on purpose: nothing is stored, so every visitor starts from the same deliberately bland NUVOX copy. Sample pages: `/content/nuvox/us/en/products/airwave-pro` (7 components) and `/content/nuvox/us/en/about-us` (3). Locally, real AEM and the mock can't both use port 4502, so run the mock on another port and point `AEM_HOST` at it.
+
+With `AEM_MODE=mock` the UI shows a **Demo mode** panel: content comes from a mock AEM server, publishing is only logged, and live updates can't be shown because real AEM is heavy to run. It links to the demo video, offers one-click sample pages, and the publish toast says it was a demo.
+
+## Deploy (one public URL)
+
+The `Dockerfile` builds the React app and runs everything in one container: FastAPI serves the site and the API, and the mock AEM runs beside it on `127.0.0.1:4502` (`AEM_MODE=mock`).
+
+**Render** (free tier): New > Blueprint > pick this repo (it reads `render.yaml`), paste `GEMINI_API_KEY` when asked, deploy. Any Docker host works the same way (Railway, Fly.io, Cloud Run): set `GEMINI_API_KEY` and expose `$PORT`.
+
+Every visitor's "Fetch" makes dozens of Gemini calls, so the key's quota is the limit for a public demo. Free-tier hosts also sleep when idle, so the first load after a pause takes a while.
 
 ## Brand guidelines
 
@@ -79,6 +104,7 @@ All text prompts (the three variants, suggest, apply) include `backend/brand_gui
 - `GET /api/health`
 
 ## Troubleshooting
+- **"No AEM page at …" in the demo** – the mock only has the two sample pages listed above.
 - **`429 RESOURCE_EXHAUSTED`** – the Gemini project is out of quota. Wait, enable billing, or use a key from a different project or another model.
 - **`404 ... models/... not found`** – `GEMINI_MODEL` isn't a valid model name for your key.
 - **"Could not reach AEM"** – check `AEM_HOST` and that AEM is running. **"rejected the credentials"** – check `AEM_USER` / `AEM_PASSWORD`.

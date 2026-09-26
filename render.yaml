@@ -1,0 +1,12 @@
+# Render Blueprint: New > Blueprint > pick this repo, then paste GEMINI_API_KEY when asked.
+services:
+  - type: web
+    name: nuvox-content-copilot
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false # you enter it in the dashboard; it is never stored in the repo
+      - key: DEMO_VIDEO_URL
+        value: https://youtu.be/mErtyRKxPn0

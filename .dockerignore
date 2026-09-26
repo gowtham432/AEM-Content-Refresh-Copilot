@@ -1,0 +1,9 @@
+# Never bake secrets or local junk into the image
+**/.env
+**/.venv
+**/node_modules
+**/__pycache__
+**/dist
+backend/static/generated
+.git
+*.log

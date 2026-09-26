@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import PageInput from './components/PageInput.jsx'
+import AemExplainerPanel from './components/AemExplainerPanel.jsx'
 import ComponentSection from './components/ComponentSection.jsx'
 import PublishBar from './components/PublishBar.jsx'
 import { useFetchPage } from './hooks/useFetchPage.js'
@@ -12,10 +13,21 @@ export default function App() {
   const img = useGenerateImageVariants()
   const [isPublishing, setIsPublishing] = useState(false)
   const [toast, setToast] = useState(null) // { kind: 'success' | 'error', text }
+  const [path, setPath] = useState('')
+  // "mock" = built-in demo AEM (nothing goes live); "live" = a real AEM author. Assume mock until told otherwise.
+  const [config, setConfig] = useState({ aemMode: 'mock', demoVideoUrl: '' })
+  const isDemo = config.aemMode === 'mock'
+
+  useEffect(() => {
+    fetch('/api/config')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((c) => c && setConfig(c))
+      .catch(() => {}) // backend down: keep the defaults, the fetch error will explain
+  }, [])
 
   useEffect(() => {
     if (!toast) return
-    const t = setTimeout(() => setToast(null), 5000)
+    const t = setTimeout(() => setToast(null), toast.kind === 'error' ? 12000 : 5000)
     return () => clearTimeout(t)
   }, [toast])
 
@@ -29,11 +41,12 @@ export default function App() {
   )
   const editedCount = components.filter((c) => !isImage(c) && text.edits[c.id] !== undefined).length
 
-  const handleFetch = async (path) => {
+  const handleFetch = async (pagePath) => {
+    setPath(pagePath)
     text.reset()
     img.reset()
     setToast(null)
-    const data = await fetchPage(path)
+    const data = await fetchPage(pagePath)
     if (!data) return
     text.generate(data.components.filter((c) => !isImage(c)))
     img.generate(data.components.filter(isImage))
@@ -69,12 +82,28 @@ export default function App() {
       if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || `Server returned ${res.status}`)
       const data = await res.json()
       const picks = data.published.map((p) => p.variant).filter(Boolean)
-      setToast({
-        kind: 'success',
-        text: `Published ${data.published.length} of ${components.length} components${
-          picks.length ? ` (${picks.join(', ')})` : ''
-        }!`,
-      })
+      const failed = data.failed ?? []
+      if (failed.length) {
+        // One component failing doesn't block the rest; say which ones didn't make it and why.
+        const nameOf = (id) => components.find((c) => c.id === id)?.label ?? id
+        setToast({
+          kind: 'error',
+          text: `Published ${data.published.length} of ${selectedComponents.length}. Failed: ${failed
+            .map((f) => `${nameOf(f.id)} – ${f.reason}`)
+            .join(' · ')}`,
+        })
+      } else {
+        setToast({
+          kind: 'success',
+          text: isDemo
+            ? `Demo publish: ${data.published.length} of ${components.length} components sent to the mock AEM${
+                picks.length ? ` (${picks.join(', ')})` : ''
+              }. Nothing goes live here, so watch the demo video to see it on a real AEM site.`
+            : `Published ${data.published.length} of ${components.length} components${
+                picks.length ? ` (${picks.join(', ')})` : ''
+              }!`,
+        })
+      }
     } catch (e) {
       setToast({ kind: 'error', text: `Publish failed: ${e.message}` })
     } finally {
@@ -96,7 +125,13 @@ export default function App() {
             Pull a page, get three AI takes on every component, pick your favorite, tweak it, publish. Done.
           </p>
           <div className="mx-auto mt-8 max-w-2xl">
-            <PageInput onFetch={handleFetch} isLoading={isLoading} />
+            <PageInput
+              value={path}
+              onChange={setPath}
+              onFetch={handleFetch}
+              isLoading={isLoading}
+              placeholder={isDemo ? '/content/nuvox/us/en/products/airwave-pro' : '/content/your-site/us/en/home'}
+            />
             {error && (
               <p className="mt-3 rounded-full border border-coral/30 bg-coral/10 px-4 py-2 text-sm text-coral">
                 Could not fetch page: {error}
@@ -107,6 +142,14 @@ export default function App() {
       </header>
 
       <main className="mx-auto w-full max-w-[1440px] flex-1 space-y-6 px-6 pb-10 pt-4">
+        {isDemo && (
+          <AemExplainerPanel
+            videoUrl={config.demoVideoUrl}
+            hasPage={!!page}
+            isLoading={isLoading}
+            onLoad={handleFetch}
+          />
+        )}
         {page && (
           <div className="animate-rise flex flex-wrap items-end justify-between gap-4">
             <div>
@@ -170,7 +213,7 @@ export default function App() {
 
       {toast && (
         <div
-          className={`fixed right-6 top-6 z-20 animate-rise rounded-2xl border px-5 py-3 text-sm font-semibold shadow-2xl backdrop-blur-xl ${
+          className={`fixed right-6 top-6 z-20 max-w-md animate-rise rounded-2xl border px-5 py-3 text-sm font-semibold shadow-2xl backdrop-blur-xl ${
             toast.kind === 'success'
               ? 'border-mint/40 bg-mint/15 text-mint shadow-mint/10'
               : 'border-coral/40 bg-coral/15 text-coral shadow-coral/10'

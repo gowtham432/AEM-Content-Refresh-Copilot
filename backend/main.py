@@ -19,7 +19,6 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
 
 import aem
-from mock_data import DEFAULT_MOCK, MOCK_PAGES
 from prompts import (
     APPLY_PROMPT,
     BOLD_REWRITE_PROMPT,
@@ -42,7 +41,6 @@ client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 STATIC_DIR = Path(__file__).parent / "static"
 GENERATED_DIR = STATIC_DIR / "generated"
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-(STATIC_DIR / "mock-images").mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="AEM Content Refresh Copilot")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -65,6 +63,8 @@ def fill(template: str, **values: str) -> str:
         template = template.replace("{" + key + "}", value)
     return template
 
+
+DEMO_VIDEO_URL = os.environ.get("DEMO_VIDEO_URL", "https://youtu.be/mErtyRKxPn0").strip()
 
 GEMINI_SLOTS = asyncio.Semaphore(8)  # cap concurrent Gemini calls so a big page doesn't trip rate limits
 _TRANSIENT = ("429", "500", "503", "UNAVAILABLE", "RESOURCE_EXHAUSTED")
@@ -105,16 +105,14 @@ def strip_fences(text: str) -> str:
 
 @app.get("/api/fetch-page")
 async def fetch_page(path: str):
-    path = path.strip().rstrip("/")
-    if aem.AEM_ENABLED:
-        try:
-            return await aem.fetch_from_aem(path)
-        except aem.AemError as e:
-            raise HTTPException(status_code=e.status, detail=e.message)
-    page = MOCK_PAGES.get(path)
-    if page is None:
-        page = {**DEFAULT_MOCK, "pagePath": path}
-    return page
+    path = aem.normalize_page_path(path)
+    try:
+        return await aem.fetch_from_aem(path)
+    except aem.AemError as e:
+        detail = e.message
+        if e.status == 404 and aem.AEM_MODE == "mock":
+            detail += ". The demo has two pages: /content/nuvox/us/en/products/airwave-pro and /content/nuvox/us/en/about-us"
+        raise HTTPException(status_code=e.status, detail=detail)
 
 
 # ---------- text variants: 3 strategies / models per component ----------
@@ -154,6 +152,29 @@ TEXT_VARIANTS = [
 ]
 
 
+_TEASER_LABEL = re.compile(r"^\s*(Pretitle|Title|Description|CTA)\s*:", re.I | re.M)
+TEASER_REMINDER = (
+    "\n\nIMPORTANT: your last answer dropped the field labels. Output the teaser as separate lines that start with "
+    "exactly the same labels as the current content ('Pretitle:', 'Title:', 'Description:', 'CTA:'), one field per line."
+)
+
+
+def _teaser_labels(text: str) -> set[str]:
+    return {m.group(1).lower() for m in _TEASER_LABEL.finditer(text)}
+
+
+async def _text_for(model: str, prompt: str, comp: GenerateComponent) -> str:
+    """One variant's text. A teaser must keep its labelled lines, or it can't be written back to AEM."""
+    text = strip_fences(await gemini_text(prompt, model))
+    if not text:
+        raise ValueError("empty response")
+    if comp.type == "teaser" and not _teaser_labels(comp.currentContent) <= _teaser_labels(text):
+        text = strip_fences(await gemini_text(prompt + TEASER_REMINDER, model))
+        if not text or not _teaser_labels(comp.currentContent) <= _teaser_labels(text):
+            raise ValueError("did not keep the teaser's Title/Description/CTA lines")
+    return text
+
+
 async def generate_text_variant(cfg: dict, comp: GenerateComponent) -> dict:
     prompt = fill(
         cfg["prompt"],
@@ -164,17 +185,15 @@ async def generate_text_variant(cfg: dict, comp: GenerateComponent) -> dict:
     variant = {k: cfg[k] for k in ("variantId", "label", "model", "color")}
     try:
         try:
-            text = strip_fences(await gemini_text(prompt, cfg["model"]))
+            text = await _text_for(cfg["model"], prompt, comp)
         except Exception as e:
             if cfg["model"] == MODEL:
                 raise
-            # A non-default model (e.g. Omni) is down: fall back so the card isn't empty.
+            # A non-default model (e.g. Omni) failed: fall back so the card isn't empty.
             log.warning("%s failed for %s (%s); falling back to %s", cfg["model"], comp.id, e, MODEL)
-            text = strip_fences(await gemini_text(prompt, MODEL))
+            text = await _text_for(MODEL, prompt, comp)
             variant["model"] = MODEL
             variant["fallbackFrom"] = cfg["model"]
-        if not text:
-            raise ValueError("empty response")
         variant["generatedContent"] = text
     except Exception as e:
         log.warning("%s variant failed for %s: %s", cfg["variantId"], comp.id, e)
@@ -338,12 +357,10 @@ async def upload_image(req: UploadImageRequest):
     return {"componentId": req.componentId, "generatedImageUrl": f"/static/generated/{path.name}"}
 
 
-# ---------- aem-image (authenticated DAM proxy for real AEM mode) ----------
+# ---------- aem-image (authenticated DAM proxy) ----------
 
 @app.get("/api/aem-image")
 async def aem_image(path: str):
-    if not aem.AEM_ENABLED:
-        raise HTTPException(status_code=404, detail="AEM is not enabled")
     try:
         body, content_type = await aem.fetch_asset(path)
     except aem.AemError as e:
@@ -423,27 +440,42 @@ class PublishRequest(BaseModel):
     components: list[PublishComponent]
 
 
+def _check_jcr_path(path: str) -> None:
+    """Refuse anything that isn't a plain node path under /content (e.g. one with '.html/' in it)."""
+    if not path.startswith("/content/") or ".." in path or re.search(r"\.(?:html?|json|xml)(?:/|$)", path):
+        raise aem.AemError(400, f"Refusing to write to '{path}': not a valid JCR node path")
+
+
+async def _publish_one(c: PublishComponent) -> None:
+    _check_jcr_path(c.jcrPath)
+    if c.type == "image":
+        # Overwrites the component's image (DAM asset or inline file) with the new one.
+        log.info("Replaced image %s", await aem.replace_image(c.jcrPath, _generated_bytes(c.updatedImageUrl)))
+    else:
+        await aem.publish_to_aem(c.jcrPath, c.type, c.updatedContent)
+
+
 @app.post("/api/publish")
 async def publish(req: PublishRequest):
-    if aem.AEM_ENABLED:
+    """Publishes each selected component on its own; one failing doesn't block the rest."""
+    published, failed = [], []
+    for c in req.components:
         try:
-            for c in req.components:
-                if c.type == "image":
-                    # Overwrites the DAM asset the component points at with the new image.
-                    asset = await aem.replace_dam_image(c.jcrPath, _generated_bytes(c.updatedImageUrl))
-                    log.info("Replaced DAM asset %s", asset)
-                else:
-                    await aem.publish_to_aem(c.jcrPath, c.type, c.updatedContent)
+            await _publish_one(c)
+            published.append(c)
         except aem.AemError as e:
-            raise HTTPException(status_code=e.status, detail=e.message)
-        log.info("Published %d components to AEM page %s", len(req.components), req.pagePath)
-    else:
-        log.info("Would publish to AEM: %s", req.model_dump_json(indent=2))
+            log.warning("publish failed for %s (%s): %s", c.id, c.jcrPath, e.message)
+            failed.append({"id": c.id, "reason": e.message})
+    log.info("Published %d/%d components to AEM page %s", len(published), len(req.components), req.pagePath)
+
+    message = f"Published {len(published)} of {len(req.components)} components to AEM"
+    if failed:
+        message += f"; {len(failed)} failed"
     return {
-        "status": "success",
-        "message": f"Published {len(req.components)} components to AEM",
-        "published": [{"id": c.id, "variant": c.selectedVariant} for c in req.components],
-        "skipped": [],  # the frontend only sends components that have a selected variant
+        "status": "partial" if failed and published else "failed" if failed else "success",
+        "message": message,
+        "published": [{"id": c.id, "variant": c.selectedVariant} for c in published],
+        "failed": failed,
     }
 
 
@@ -456,6 +488,18 @@ def _generated_bytes(url: str | None) -> bytes:
     return path.read_bytes()
 
 
+@app.get("/api/config")
+async def config():
+    """What the UI needs to know up front: demo (mock AEM) vs live AEM, and where the demo video is."""
+    return {"aemMode": aem.AEM_MODE, "demoVideoUrl": DEMO_VIDEO_URL}
+
+
 @app.get("/api/health")
 async def health():
     return {"ok": True}
+
+
+# In a single-service deploy the built frontend is served from here. Mounted last so /api and /static win.
+FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+if FRONTEND_DIST.is_dir():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")

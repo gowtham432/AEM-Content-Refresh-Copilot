@@ -1,11 +1,7 @@
-import { useState } from 'react'
-
-export default function PageInput({ onFetch, isLoading }) {
-  const [path, setPath] = useState('')
-
+export default function PageInput({ value, onChange, onFetch, isLoading, placeholder }) {
   const submit = (e) => {
     e.preventDefault()
-    if (path.trim() && !isLoading) onFetch(path.trim())
+    if (value.trim() && !isLoading) onFetch(value.trim())
   }
 
   return (
@@ -15,14 +11,14 @@ export default function PageInput({ onFetch, isLoading }) {
     >
       <span className="text-slate-400">🔗</span>
       <input
-        value={path}
-        onChange={(e) => setPath(e.target.value)}
-        placeholder="/content/aisearchspa/us/en/home"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
         className="min-w-0 flex-1 bg-transparent py-2 text-sm text-ghost placeholder-slate-500 focus:outline-none"
       />
       <button
         type="submit"
-        disabled={isLoading || !path.trim()}
+        disabled={isLoading || !value.trim()}
         className="grad-btn flex items-center gap-2 rounded-full px-6 py-2.5 text-sm font-semibold"
       >
         {isLoading ? <Spinner /> : '⚡'}
