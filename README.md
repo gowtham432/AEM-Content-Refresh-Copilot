@@ -56,6 +56,7 @@ The backend reads `.env` only at startup, and Vite reads `tailwind.config.js` on
 - Each component is published independently: one failure is reported (with the reason) and doesn't block the others. Teaser variants are forced to keep their `Title:/Description:/CTA:` lines; a teaser can also be published partially (only the labelled fields present are written).
 - Text and title: a Sling POST to `{AEM_HOST}{jcrPath}` (`text` + `textIsRich=true`, or `jcr:title`). Teaser: `pretitle`, `jcr:title`, `jcr:description`, and the first button's text under `actions/`.
 - **Image publish overwrites the existing image**, re-encoded to its own format (a `.jpg` stays a JPEG): for a DAM asset it replaces the original via the Assets HTTP API (`PUT /api/assets/...`), so every page using that asset shows the new image; for an inline image it replaces the component's `file` node.
+- After every publish the component's `jcr:lastModified` (and the page's `cq:lastModified`) is updated, like the AEM editor does. AEM builds image URLs from it (`.coreimg.jpeg/<lastModified>/...`), so without this a replaced image keeps its old URL and browsers keep showing the cached picture.
 - Rich text is shown as plain text. Publishing rewrites it as simple `<p>` paragraphs, so inline formatting (bold, links) is lost.
 - All of this **changes real content**, so try it on a scratch page first.
 

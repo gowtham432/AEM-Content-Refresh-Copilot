@@ -1,12 +1,16 @@
 import html
 import io
+import logging
 import os
 import re
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
 from PIL import Image
+
+log = logging.getLogger("uvicorn.error")
 
 load_dotenv()  # this module reads env at import time, before main.py's own load_dotenv()
 
@@ -253,6 +257,7 @@ async def replace_image(jcr_path: str, image_bytes: bytes) -> str:
                 )
                 if resp.status_code not in (200, 201):
                     raise AemError(502, f"AEM returned {resp.status_code} replacing {asset}")
+                await _touch(http, jcr_path)
                 return asset
 
             if isinstance(props.get("file"), dict):
@@ -275,6 +280,7 @@ async def replace_image(jcr_path: str, image_bytes: bytes) -> str:
                 )
                 if resp.status_code not in (200, 201):
                     raise AemError(502, f"AEM returned {resp.status_code} replacing {jcr_path}/file")
+                await _touch(http, jcr_path)
                 return f"{jcr_path}/file"
 
             raise AemError(400, f"{jcr_path} has no image (no fileReference or file)")
@@ -286,6 +292,32 @@ async def _sling_post(http: httpx.AsyncClient, jcr_path: str, form: dict) -> Non
     resp = await http.post(f"{AEM_HOST}{jcr_path}", auth=AEM_AUTH, data=form)
     if resp.status_code not in (200, 201):
         raise AemError(502, f"AEM returned {resp.status_code} updating {jcr_path}")
+
+
+async def _touch(http: httpx.AsyncClient, jcr_path: str) -> None:
+    """Mark the component (and its page) as modified, like the AEM editor does.
+
+    A Sling POST doesn't update jcr:lastModified, but AEM builds image URLs from it
+    (`.../teaser.coreimg.jpeg/<lastModified>/name.jpg`). Without this an updated image keeps the same
+    URL, so browsers and caches go on showing the old one. Best effort: never fails the publish.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    who = AEM_AUTH[0]
+    try:
+        await _sling_post(
+            http,
+            jcr_path,
+            {"jcr:lastModified@TypeHint": "Date", "jcr:lastModified": now, "jcr:lastModifiedBy": who},
+        )
+        if "/jcr:content" in jcr_path:
+            page_content = jcr_path.split("/jcr:content", 1)[0] + "/jcr:content"
+            await _sling_post(
+                http,
+                page_content,
+                {"cq:lastModified@TypeHint": "Date", "cq:lastModified": now, "cq:lastModifiedBy": who},
+            )
+    except (AemError, httpx.HTTPError) as e:
+        log.warning("could not update lastModified on %s: %s", jcr_path, e)
 
 
 async def publish_to_aem(jcr_path: str, comp_type: str, content: str) -> None:
@@ -318,5 +350,6 @@ async def publish_to_aem(jcr_path: str, comp_type: str, content: str) -> None:
                         await _sling_post(http, f"{jcr_path}/actions/{first}", {"text": fields["CTA"]})
             else:
                 raise AemError(400, f"Publishing '{comp_type}' components is not supported")
+            await _touch(http, jcr_path)
     except httpx.HTTPError as e:
         raise AemError(502, f"Could not reach AEM at {AEM_HOST}: {e.__class__.__name__}")
