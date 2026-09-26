@@ -29,3 +29,6 @@ Thumbs.db
 
 # Claude Code local state
 .claude/
+
+# AI-generated images (regenerated at runtime)
+backend/static/generated/

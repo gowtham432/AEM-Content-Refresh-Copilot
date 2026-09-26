@@ -1,6 +1,6 @@
 # AEM Content Refresh Copilot
 
-Enter an AEM page path and see each component's current content next to a Gemini-refreshed, **on-brand** version. Edit the right side and get live suggestions (2-second debounce), then publish back to AEM.
+Enter an AEM page path and see each component's current content next to a Gemini-refreshed, **on-brand** version. Text is rewritten in the brand voice, and **images are regenerated** by Gemini's image model from an auto-written, editable prompt. Edit the right side, get live suggestions (2-second debounce), then publish back to AEM.
 
 - **Frontend:** React + Vite + Tailwind
 - **Backend:** FastAPI + Google Gemini (`google-genai`)
@@ -32,6 +32,7 @@ The backend reads `.env` only at startup, and Vite reads `tailwind.config.js` on
 | --- | --- | --- |
 | `GEMINI_API_KEY` | – | Required. Get one from Google AI Studio. Never commit it. |
 | `GEMINI_MODEL` | `gemini-3.8-flash` | Use a model your key has quota for, e.g. `gemini-3-flash-preview`. |
+| `GEMINI_IMAGE_MODEL` | `gemini-3.1-flash-lite-image` | Image generation model. |
 | `AEM_ENABLED` | `false` | `false` = mock pages, `true` = real AEM. |
 | `AEM_HOST` | `http://localhost:4502` | AEM author instance. |
 | `AEM_USER` / `AEM_PASSWORD` | `admin` / `admin` | Basic auth for fetch and publish. |
@@ -40,18 +41,21 @@ The backend reads `.env` only at startup, and Vite reads `tailwind.config.js` on
 ## Using it
 
 1. Enter an AEM page path, e.g. `/content/aisearchspa/us/en/home`, and click **Fetch content**.
-2. Gemini rewrites every component in parallel. Each card shows *Before* (read-only) and *After* (editable), with a status of Original, AI generated or User edited. **Regen** re-runs a single component.
-3. Edit the right side. After you pause typing, three suggestions appear; click one to apply it.
-4. Click **Publish** to write the content back to AEM.
+2. Gemini rewrites every text component and generates a new image for every image component, all in parallel. Each card shows *Before* (read-only) and *After*. **Regen** re-runs a single component.
+3. **Text:** edit the right side. After you pause typing, three suggestions appear; click one to apply it.
+4. **Images:** the prompt behind each generated image is shown and editable. Change it (e.g. "violet glow" to "hot coral glow") and click **Regenerate with this prompt**, or **Upload my own** image instead. Status: AI generated, Custom prompt or Uploaded.
+5. Click **Publish** to write the content back to AEM.
 
 ### AEM mode (`AEM_ENABLED=true`)
-- Fetch reads `{AEM_HOST}{path}.infinity.json` and picks up **text** and **title** components under `jcr:content`. Other component types and empty components are skipped.
+- Fetch reads `{AEM_HOST}{path}.infinity.json` and picks up **text**, **title**, **image** and **teaser** components under `jcr:content`. Images need a `/content/dam/` `fileReference` and are shown via an authenticated backend proxy. A teaser becomes two cards: its text (`Pretitle / Title / Description / CTA`) and its image. Other component types (e.g. accordion) and empty components are skipped.
+- Teaser publish writes `pretitle`, `jcr:title`, `jcr:description` and the first button's text under `actions/`.
+- **Image publish overwrites the DAM asset** the component's `fileReference` points at (Assets HTTP API `PUT /api/assets/...`), re-encoded to the asset's own format (a `.jpg` stays a JPEG). Every page using that asset will show the new image, so try it on a test asset first. In mock mode the image URL is just logged.
 - Rich text is shown as plain text. Publishing rewrites it as simple `<p>` paragraphs, so inline formatting (bold, links) is lost.
 - Publish sends a Sling POST per component to `{AEM_HOST}{jcrPath}` (`text` + `textIsRich=true`, or `jcr:title`). It **changes real content**, so try it on a scratch page first.
 
 ### Mock mode (`AEM_ENABLED=false`)
-Serves deliberately bland, corporate NUVOX copy from `backend/mock_data.py` so the brand refresh is an instant contrast:
-- `/content/nuvox/us/en/products/aura-headphones` (text, accordion, teaser)
+Serves deliberately bland, corporate NUVOX copy and plain grey placeholder images (`backend/static/mock-images/`, recreate with `python create_mock_images.py`) so the brand refresh is an instant contrast:
+- `/content/nuvox/us/en/products/airwave-pro` (text, 2 images, accordion, teaser)
 - `/content/nuvox/us/en/about-us`
 - any other path returns a sample page. Publish only logs the payload.
 
@@ -61,10 +65,13 @@ All Gemini prompts (generate, suggest, apply) include `backend/brand_guidelines.
 
 ## API
 - `GET /api/fetch-page?path=` – components on the page
-- `POST /api/generate` – parallel Gemini rewrite, one call per component
+- `POST /api/generate-text` – parallel Gemini rewrite, one call per text component
+- `POST /api/generate-image` – generates an image; without a `prompt` it first writes an on-brand one from the image's context. Files are saved to `backend/static/generated/` (gitignored) and served under `/static/`
+- `POST /api/upload-image` – stores the user's own replacement image (validated, max 8 MB)
 - `POST /api/suggest` – 3 suggestions on the user's draft
 - `POST /api/apply` – applies one clicked suggestion to the draft
 - `POST /api/publish` – writes content to AEM (or logs it in mock mode)
+- `GET /api/aem-image?path=` – authenticated proxy for DAM images (AEM mode only)
 - `GET /api/health`
 
 ## Troubleshooting

@@ -2,7 +2,7 @@ import { useCallback, useRef, useState } from 'react'
 
 // Holds the right-hand (refreshed) content for every component, plus its status:
 // 'original' | 'ai' | 'edited'.
-export function useGenerate() {
+export function useGenerateText() {
   const [contents, setContents] = useState({})
   const [statuses, setStatuses] = useState({})
   const [loadingIds, setLoadingIds] = useState({})
@@ -26,7 +26,7 @@ export function useGenerate() {
 
     let results
     try {
-      const res = await fetch('/api/generate', {
+      const res = await fetch('/api/generate-text', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -3,11 +3,14 @@ import PageInput from './components/PageInput.jsx'
 import ComponentRow from './components/ComponentRow.jsx'
 import PublishBar from './components/PublishBar.jsx'
 import { useFetchPage } from './hooks/useFetchPage.js'
-import { useGenerate } from './hooks/useGenerate.js'
+import { useGenerateText } from './hooks/useGenerateText.js'
+import { useGenerateImage } from './hooks/useGenerateImage.js'
 
 export default function App() {
   const { fetchPage, page, isLoading, error } = useFetchPage()
-  const { contents, statuses, loadingIds, errors, generate, reset, edit } = useGenerate()
+  const text = useGenerateText()
+  const img = useGenerateImage()
+  const { contents, statuses } = text
   const [isPublishing, setIsPublishing] = useState(false)
   const [toast, setToast] = useState(null) // { kind: 'success' | 'error', text }
 
@@ -18,13 +21,25 @@ export default function App() {
   }, [toast])
 
   const components = page?.components ?? []
-  const anyLoading = Object.values(loadingIds).some(Boolean)
+  const anyLoading = [...Object.values(text.loadingIds), ...Object.values(img.loadingIds)].some(Boolean)
+  const aiCount =
+    Object.values(statuses).filter((s) => s === 'ai').length +
+    Object.values(img.images).filter((i) => i.status === 'ai').length
+  const editedCount =
+    Object.values(statuses).filter((s) => s === 'edited').length +
+    Object.values(img.images).filter((i) => i.status !== 'ai').length
+
+  // Image components only go out once there is a generated/uploaded replacement.
+  const publishable = components.filter((c) => c.type !== 'image' || img.images[c.id]?.url)
 
   const handleFetch = async (path) => {
-    reset()
+    text.reset()
+    img.reset()
     setToast(null)
     const data = await fetchPage(path)
-    if (data) generate(data.components)
+    if (!data) return
+    text.generate(data.components.filter((c) => c.type !== 'image'))
+    img.generate(data.components.filter((c) => c.type === 'image'))
   }
 
   const handlePublish = async () => {
@@ -35,17 +50,21 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           pagePath: page.pagePath,
-          components: components.map((c) => ({
-            id: c.id,
-            type: c.type,
-            jcrPath: c.jcrPath,
-            updatedContent: contents[c.id] ?? c.currentContent,
-          })),
+          components: publishable.map((c) =>
+            c.type === 'image'
+              ? { id: c.id, type: c.type, jcrPath: c.jcrPath, updatedImageUrl: img.images[c.id].url }
+              : { id: c.id, type: c.type, jcrPath: c.jcrPath, updatedContent: contents[c.id] ?? c.currentContent },
+          ),
         }),
       })
       if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || `Server returned ${res.status}`)
       const data = await res.json()
-      setToast({ kind: 'success', text: `Published ${data.published.length} components successfully!` })
+      setToast({
+        kind: 'success',
+        text: data.skipped?.length
+          ? data.message
+          : `Published ${data.published.length} components successfully!`,
+      })
     } catch (e) {
       setToast({ kind: 'error', text: `Publish failed: ${e.message}` })
     } finally {
@@ -90,11 +109,9 @@ export default function App() {
                 {components.length} component{components.length === 1 ? '' : 's'}
               </span>
               <span className="rounded-full bg-violet-500/20 px-3 py-1.5 text-violet-300">
-                {Object.values(statuses).filter((s) => s === 'ai').length} AI generated
+                {aiCount} AI generated
               </span>
-              <span className="rounded-full bg-mint/15 px-3 py-1.5 text-mint">
-                {Object.values(statuses).filter((s) => s === 'edited').length} edited
-              </span>
+              <span className="rounded-full bg-mint/15 px-3 py-1.5 text-mint">{editedCount} edited</span>
             </div>
           </div>
         )}
@@ -103,12 +120,25 @@ export default function App() {
             key={c.id}
             index={i}
             component={c}
-            generatedContent={contents[c.id]}
-            status={statuses[c.id] || 'original'}
-            isLoading={!!loadingIds[c.id]}
-            error={errors[c.id]}
-            onContentChange={(text) => edit(c.id, text)}
-            onRegenerate={() => generate([c])}
+            text={{
+              generatedContent: contents[c.id],
+              status: statuses[c.id] || 'original',
+              isLoading: !!text.loadingIds[c.id],
+              error: text.errors[c.id],
+              onContentChange: (value) => text.edit(c.id, value),
+              onRegenerate: () => text.generate([c]),
+            }}
+            image={{
+              image: img.images[c.id],
+              draft: img.drafts[c.id],
+              status: img.images[c.id]?.status || 'original',
+              isLoading: !!img.loadingIds[c.id],
+              error: img.errors[c.id],
+              onDraftChange: (value) => img.setDraft(c.id, value),
+              onRegenerate: () => img.generateOne(c),
+              onRegenerateWithPrompt: () => img.generateOne(c, img.drafts[c.id]),
+              onUpload: (file) => img.upload(c, file),
+            }}
           />
         ))}
         {!page && !isLoading && (
@@ -116,9 +146,9 @@ export default function App() {
             <div className="grid gap-4 sm:grid-cols-3">
               {[
                 ['🔗', 'Fetch', 'Drop in an AEM page path and we pull every component.'],
-                ['✨', 'Refresh', 'Gemini rewrites each one in your brand voice, in parallel.'],
+                ['✨', 'Refresh', 'Gemini rewrites the copy and generates fresh on-brand images, in parallel.'],
                 ['🚀', 'Publish', 'Edit with live tips, then push it back to AEM.'],
-              ].map(([icon, title, text], i) => (
+              ].map(([icon, title, blurb], i) => (
                 <div
                   key={title}
                   className="glass animate-rise rounded-3xl p-5"
@@ -128,7 +158,7 @@ export default function App() {
                     {icon}
                   </div>
                   <div className="font-display font-bold">{title}</div>
-                  <p className="mt-1 text-sm leading-relaxed text-slate-400">{text}</p>
+                  <p className="mt-1 text-sm leading-relaxed text-slate-400">{blurb}</p>
                 </div>
               ))}
             </div>
@@ -146,7 +176,7 @@ export default function App() {
           onPublish={handlePublish}
           isPublishing={isPublishing}
           disabled={anyLoading}
-          componentCount={components.length}
+          componentCount={publishable.length}
         />
       )}
 

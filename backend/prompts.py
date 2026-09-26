@@ -62,6 +62,28 @@ Return a JSON array of 3 strings. Nothing else.
 Example: ["Swap 'premium quality' for something you can feel, like 'bass that hits your chest'", "Include the keyword 'wireless headphones' naturally", "Open with a short punchy fragment instead of a long sentence"]
 Return ONLY the JSON array, no markdown fences."""
 
+IMAGE_PROMPT_GENERATOR = """You generate image prompts for NUVOX, a Gen Z wireless earphones brand.
+
+Brand aesthetic:
+- Dark backgrounds (near black or deep midnight blue)
+- Neon accent lighting: Electric Violet (#8B5CF6), Neon Mint (#34D399), Hot Coral (#FB7185)
+- Products floating/levitating with subtle shadow
+- Particle effects, light trails, bokeh
+- Clean minimal composition
+- Futuristic but approachable
+- Think: Apple product shots meets cyberpunk aesthetics
+- Audience is Gen Z (16-27), style-obsessed, Instagram/TikTok native
+
+Image purpose on the page: {image_context}
+Current alt text: {alt_text}
+
+Generate a single image generation prompt (2-3 sentences max) that will produce a stunning replacement image.
+Describe: the main subject, exact positioning/pose, lighting direction and color, background treatment, effects, and overall mood.
+The prompt must be specific enough for an AI image generator to produce a consistent, on-brand result.
+Do not ask for any text, logos or lettering inside the image.
+
+Return ONLY the prompt string. No explanation."""
+
 APPLY_PROMPT = """You are an editor for enterprise web content.
 
 BRAND GUIDELINES:
